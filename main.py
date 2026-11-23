@@ -4,9 +4,12 @@ In QQ chats the chat model gets generate_image. The persona decides whether
 to draw; the tool only reserves the picture, and the host runs `deliver`
 after the text reply went out (or `cancel`, which gives the count back, when
 it did not). change_outfit remembers what she changed into without a
-picture; both tools take effect only once the reply went out.
+picture; both tools take effect only once the reply went out. When someone
+sends pictures, her look and reference pictures go along (turn_context) so
+she knows herself in them.
 """
 import asyncio
+import inspect
 
 from shiori.extension_host import ToolResult
 from .engine import (ASPECTS, MAX_OUTFIT, MAX_PROMPT, MAX_UPLOAD_BYTES, ImageGen, ImageGenError, chat_reason,
@@ -56,6 +59,15 @@ def outfit_schema(wearing='', default=''):
             'additionalProperties': False}}}
 
 
+def picture_note(args, outfit=''):
+    """What a sent picture shows, so her later replies know what the other side is looking at."""
+    parts = ['你的自拍' if args.get('self_portrait') is True else '你画的图']
+    if outfit:
+        parts.append('穿着 ' + outfit)
+    parts.append(args['prompt'])
+    return '；'.join(parts)
+
+
 def setup(ext):
     engine = ImageGen(ext.store, ext.settings, ext.data_dir, options=ext.config)
     ext.state['engine'] = engine
@@ -90,12 +102,19 @@ def setup(ext):
             if outfit:
                 # She said she would wear it; later self portraits keep it even if this picture fails.
                 engine.set_outfit(call.scope_id, call.persona_id, outfit)
+            # Later turns are told what she sent or failed to; an older Shiori takes the picture alone.
+            note = picture_note(call.args, outfit or (job.get('outfit') if job.get('self_portrait') else ''))
             try:
                 raw, _ = await engine.run(job['id'])
             except ImageGenError as exc:
-                await send.text(f'这张图没画出来（{chat_reason(exc)}），次数已经退回，稍后再试吧。')
+                reason = chat_reason(exc)
+                # A refusal comes back the same way next time; only other failures are worth retrying.
+                await send.text(f'这张图没画出来（{reason}），次数已经退回' + ('。' if '内容政策' in reason else '，稍后再试吧。'))
+                if callable(getattr(send, 'image_failed', None)):
+                    send.image_failed(note, reason)
                 return
-            sent = await send.image(raw)
+            sent = await (send.image(raw, description=note) if 'description' in inspect.signature(send.image).parameters
+                          else send.image(raw))
             ext.store.add_event('imagegen_sent' if sent else 'imagegen_unsent',
                                 '图片已发送' if sent else '图片已生成，但没有发出或没有得到送达确认',
                                 scope_id=call.scope_id, bytes=len(raw))
@@ -130,6 +149,28 @@ def setup(ext):
                           after_reply=remember, cancel=lambda: None)
 
     ext.tool('change_outfit', change_schema, change, queued=True)
+
+    def self_context(turn):
+        """When someone sends pictures, her look and reference pictures go
+        along, so she can tell when a picture shows her."""
+        if not turn.images or not ext.config().get('recognize_self', True):
+            return None
+        look = engine.appearance(turn.persona_id)
+        pictures = engine.self_images(turn.persona_id)
+        wearing = engine.current_outfit(turn.scope_id, turn.persona_id) or look.get('outfit', '')
+        facts = [f'外貌：{look["prompt"]}' if look.get('prompt') else '',
+                 f'现在穿着：{wearing}' if wearing else '']
+        facts = '；'.join(fact for fact in facts if fact)
+        if not facts and not pictures:
+            return None
+        text = ('【你自己的样子】' + (facts + '。' if facts else '')
+                + (f'对方这条消息后面附了 {len(pictures)} 张你自己的参考图。' if pictures else '')
+                + '对方发来的图里如果有和你长得一样的人（比如你发过的自拍、别人画的你），那就是你，按“这是我”来理解和回应；'
+                  '长得不一样就不是你。不要提起参考图或外貌设定本身。')
+        return {'text': text[:1500], 'images': pictures[:3]}
+
+    if hasattr(ext, 'turn_context'):          # an older Shiori has no such hook
+        ext.turn_context(self_context)
 
     ext.api('GET', 'state', lambda request: engine.public())
     ext.api('PUT', 'config', lambda request: engine.update(request.body))

@@ -61,6 +61,7 @@ MAX_OUTFIT_ENTRIES = 500
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 REFERENCE_SIDE, REFERENCE_LIMIT, THUMB_SIDE = 1536, 3 * 1024 * 1024, 256
 REFERENCE_NAME = re.compile(r'[0-9a-f]{16}\.(png|jpg)')
+SELF_SIDE, SELF_LIMIT = 512, 200 * 1024     # her reference as the chat model sees it
 MULTI_REFERENCE_KINDS = ('openai', 'gemini')   # the others take a single picture (img2img or one LoadImage)
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
 MAX_IMAGE_BYTES = outgoing_image.MAX_IMAGE_BYTES
@@ -79,6 +80,12 @@ SERVICE_DEFAULTS = {'id': '', 'name': '', 'kind': 'openai', 'endpoint': '', 'api
 _SERVICE_INPUT = frozenset(SERVICE_DEFAULTS) | {'api_key_set', 'clear_api_key'}
 
 
+# A service refusing a picture under its content rules, in the words services use for it.
+REFUSAL = re.compile(r'content[ _-]?polic|safety[ _-]?(?:system|filter|polic)|moderation|内容政策|违反|性化|色情|裸露|'
+                     r'不适当|无法生成涉及', re.I)
+REFUSED = '生图服务按内容政策拒绝了这张图'
+
+
 class ImageGenError(Exception):
     """A failure whose message is shown to the owner and the chat model;
     `detail` is a redacted upstream excerpt meant for the event log only."""
@@ -93,6 +100,8 @@ def chat_reason(exc):
     text = str(exc)
     if '超时' in text or '没有完成' in text:
         return '画得太久，超时了'
+    if '内容政策' in text:
+        return '被生图服务的内容政策拒绝了'
     if '安全策略' in text:
         return '被生图服务的安全策略拦下了'
     if '限流' in text or '额度' in text:
@@ -433,10 +442,13 @@ async def _send(http, service, method, url, *, limit=MAX_RESPONSE_BYTES, **kwarg
                 chunks.append(chunk)
             raw = b''.join(chunks)
             if not 200 <= response.status_code < 300:
+                detail = _detail(service, raw)
+                if response.status_code in (400, 403, 422) and (REFUSAL.search(detail) or REFUSAL.search(raw[:4000].decode('utf-8', 'replace'))):
+                    raise ImageGenError(REFUSED, detail=detail)
                 hint = ('请检查密钥、权限和模型名称' if response.status_code in (401, 403)
                         else '接口限流或额度不足，请稍后再试' if response.status_code in (402, 429)
                         else '请检查接口地址和参数')
-                raise ImageGenError(f'生图接口返回 HTTP {response.status_code}，{hint}', detail=_detail(service, raw))
+                raise ImageGenError(f'生图接口返回 HTTP {response.status_code}，{hint}', detail=detail)
             return raw, response.headers.get('Content-Type', '')
     except ImageGenError:
         raise
@@ -769,6 +781,7 @@ class ImageGen:
         self.path = self.root / 'config.json'
         self.usage_path = self.root / 'usage.json'
         self.reference_dir = self.root / 'references'
+        self._self_cache = {}        # reference name -> small data URL for the chat model
         self.outfits_path = self.root / 'outfits.json'
         self._lock = threading.RLock()
         self._jobs = {}
@@ -1008,6 +1021,22 @@ class ImageGen:
                 continue
         return images
 
+    def self_images(self, persona_id):
+        """Small JPEG data URLs of the persona's reference pictures, for the
+        chat model to know her own look; made once per picture."""
+        cache = self._self_cache
+        urls = []
+        for name in self.appearance(persona_id).get('references', []):
+            if name not in cache:
+                try:
+                    small = outgoing_image.reencode((self.reference_dir / name).read_bytes(), max_side=SELF_SIDE,
+                                                    limit=SELF_LIMIT, keep=())
+                except (OSError, ValueError):
+                    continue
+                cache[name] = 'data:image/jpeg;base64,' + base64.b64encode(small).decode('ascii')
+            urls.append(cache[name])
+        return urls
+
     def add_reference(self, persona_id, raw):
         """Store an uploaded picture as one of the persona's references (blocking)."""
         try:
@@ -1055,6 +1084,7 @@ class ImageGen:
         return self.public()
 
     def _delete_files(self, name):
+        self._self_cache.pop(name, None)
         for path in (self.reference_dir / name, self.reference_dir / (name.rsplit('.', 1)[0] + '.thumb.jpg')):
             try:
                 path.unlink()
